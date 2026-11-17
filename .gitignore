@@ -1,0 +1,8 @@
+# Build-Ergebnis
+*.exe
+*.pdb
+
+# Lokale Konfiguration und erzeugtes Symbol (pro PC)
+MonitorSwitch.ini
+MonitorSwitch.ico
+*.write-test

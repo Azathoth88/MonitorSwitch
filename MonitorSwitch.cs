@@ -9,7 +9,8 @@
 //   - Linksklick aufs Tray-Icon oder Hotkey (Standard Strg+Alt+F12) -> zum Ziel-Eingang wechseln
 //   - Rechtsklick -> Menü: Ziel wählen, direkt auf einen Eingang wechseln, Eingänge umbenennen,
 //                    Monitor wählen, Autostart, Desktop-Verknüpfung
-//   - Kommandozeile: MonitorSwitch.exe --target | --set 0x11 | --list
+//   - Pixelreinigung (ASUS ROG OLED) per Menue oder --clean anstossen
+//   - Kommandozeile: MonitorSwitch.exe --target | --set 0x11 | --list | --clean
 //
 // Konfiguration: MonitorSwitch.ini neben der .exe (Fallback: %APPDATA%\MonitorSwitch),
 // wird vom Tray-Menü gepflegt. Jeder PC hat seine eigene.
@@ -33,7 +34,7 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("MonitorSwitch")]
 [assembly: AssemblyProduct("MonitorSwitch")]
-[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyVersion("2.1.0.0")]
 
 namespace MonitorSwitch
 {
@@ -206,6 +207,77 @@ namespace MonitorSwitch
                     r.Add(v & 0xFF);
             }
             return r;
+        }
+
+        // ---- Pixelreinigung (ASUS ROG OLED)
+        // Herstellercode 0xFD ist ein Bitfeld mit Schaltern ("ToggleSettings2"). Bit 0x10 setzen startet
+        // die Pixelreinigung; der Monitor setzt das Bit danach selbst zurueck.
+        // Bestaetigt mit PG34WCDN; fuer PG49WCD siehe https://codeberg.org/beeb/asus-pixel-cleaner
+        const byte VCP_ASUS_TOGGLES = 0xFD;
+        const uint BIT_PIXEL_CLEANING = 0x10;
+        public static readonly TimeSpan PixelCleaningDuration = TimeSpan.FromMinutes(7);   // Monitor braucht ca. 6 min
+
+        public enum CleanResult { Started, NotFound, NotSupported, Failed }
+
+        /// <summary>Nur ASUS-ROG-Monitore, deren 0xFD-Maske das Reinigungsbit enthaelt (andere Hersteller belegen 0xFD anders).</summary>
+        public static bool SupportsPixelCleaning(string match)
+        {
+            List<PHYSICAL_MONITOR> l = All();
+            try
+            {
+                IntPtr h;
+                if (!Pick(l, match, out h)) return false;
+                return IsAsusRog(l, h) && ReadToggles(h) >= 0 && (lastTogglesMax & BIT_PIXEL_CLEANING) != 0;
+            }
+            finally { Free(l); }
+        }
+
+        public static CleanResult StartPixelCleaning(string match)
+        {
+            List<PHYSICAL_MONITOR> l = All();
+            try
+            {
+                IntPtr h;
+                if (!Pick(l, match, out h)) return CleanResult.NotFound;
+                if (!IsAsusRog(l, h)) return CleanResult.NotSupported;
+                long cur = ReadToggles(h);
+                if (cur < 0) return CleanResult.Failed;
+                if ((lastTogglesMax & BIT_PIXEL_CLEANING) == 0) return CleanResult.NotSupported;
+                uint value = ((uint)cur | BIT_PIXEL_CLEANING) & 0xFFFF;   // uebrige Schalter unveraendert lassen
+                for (int i = 0; i < 3; i++)
+                {
+                    if (SetVCPFeature(h, VCP_ASUS_TOGGLES, value)) return CleanResult.Started;
+                    Thread.Sleep(80);
+                }
+                return CleanResult.Failed;
+            }
+            finally { Free(l); }
+        }
+
+        static uint lastTogglesMax;
+
+        static long ReadToggles(IntPtr h)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                uint cur, max;
+                if (GetVCPFeatureAndVCPFeatureReply(h, VCP_ASUS_TOGGLES, IntPtr.Zero, out cur, out max))
+                {
+                    lastTogglesMax = max;
+                    return cur;
+                }
+                Thread.Sleep(60);
+            }
+            return -1;
+        }
+
+        static bool IsAsusRog(List<PHYSICAL_MONITOR> l, IntPtr h)
+        {
+            foreach (PHYSICAL_MONITOR m in l)
+                if (m.hPhysicalMonitor == h)
+                    return m.szPhysicalMonitorDescription != null &&
+                           m.szPhysicalMonitorDescription.IndexOf("ROG", StringComparison.OrdinalIgnoreCase) >= 0;
+            return false;
         }
 
         public static string StandardName(int v)
@@ -398,6 +470,15 @@ namespace MonitorSwitch
     // ------------------------------------------------------------------ Gemeinsame Helfer
     static class Util
     {
+        [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+
+        /// <summary>Haelt Bildschirm und PC wach (fuer die Pixelreinigung braucht der Monitor ein Signal). Gilt fuer den aufrufenden Thread.</summary>
+        public static void KeepAwake(bool on)
+        {
+            const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x1, ES_DISPLAY_REQUIRED = 0x2;
+            SetThreadExecutionState(on ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED : ES_CONTINUOUS);
+        }
+
         /// <summary>Waehlt einen Monitor mit mehreren Eingängen und als Ziel den ersten Eingang, der gerade nicht aktiv ist.</summary>
         public static void AutoDetect(Config c)
         {
@@ -487,10 +568,16 @@ namespace MonitorSwitch
 
         readonly NotifyIcon tray;
         readonly HotkeyWindow hotkey;
-        readonly ToolStripMenuItem miMain, miSwitch, miTarget, miRename, miMonitor, miAutostart;
+        readonly ToolStripMenuItem miMain, miSwitch, miClean, miTarget, miRename, miMonitor, miAutostart;
+        readonly ToolStripSeparator sepClean;
         readonly Dictionary<string, List<int>> inputCache = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+        readonly Dictionary<string, bool> cleanSupport = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        readonly System.Windows.Forms.Timer cleanTimer = new System.Windows.Forms.Timer();
         Config cfg;
         DateTime lastSwitch = DateTime.MinValue;
+        DateTime cleaningUntil = DateTime.MinValue;
+
+        bool Cleaning { get { return DateTime.Now < cleaningUntil; } }
 
         public TrayApp()
         {
@@ -503,6 +590,8 @@ namespace MonitorSwitch
             miMain      = new ToolStripMenuItem("Wechseln", null, delegate { SwitchToTarget(); });
             miMain.Font = new Font(miMain.Font, FontStyle.Bold);
             miSwitch    = new ToolStripMenuItem("Jetzt wechseln zu");
+            miClean     = new ToolStripMenuItem("Pixelreinigung starten...", null, delegate { StartCleaning(); });
+            sepClean    = new ToolStripSeparator();
             miTarget    = new ToolStripMenuItem("Ziel für Klick und Hotkey");
             miRename    = new ToolStripMenuItem("Eingang umbenennen");
             miMonitor   = new ToolStripMenuItem("Monitor");
@@ -519,6 +608,7 @@ namespace MonitorSwitch
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.AddRange(new ToolStripItem[] {
                 miMain, miSwitch,
+                sepClean, miClean,
                 new ToolStripSeparator(),
                 miTarget, miRename, miMonitor,
                 new ToolStripSeparator(),
@@ -535,6 +625,8 @@ namespace MonitorSwitch
             tray.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) SwitchToTarget(); };
             tray.Text = "MonitorSwitch";
             tray.Visible = true;
+
+            cleanTimer.Tick += delegate { CleaningFinished(); };
 
             Startup(firstRun);
         }
@@ -636,8 +728,57 @@ namespace MonitorSwitch
                 miMonitor.DropDownItems.Add(mi);
             }
 
+            bool supported;
+            if (!cleanSupport.TryGetValue(cfg.Monitor, out supported))
+            {
+                supported = Ddc.SupportsPixelCleaning(cfg.Monitor);
+                if (cur >= 0) cleanSupport[cfg.Monitor] = supported;   // nur merken, wenn der Monitor geantwortet hat
+            }
+            miClean.Visible = sepClean.Visible = supported || Cleaning;
+            miClean.Enabled = !Cleaning;
+            miClean.Text = Cleaning ? "Pixelreinigung läuft (bis " + cleaningUntil.ToString("HH:mm") + ")" : "Pixelreinigung starten...";
+
             miAutostart.Checked = IsAutostart();
             UpdateTexts();
+        }
+
+        void StartCleaning()
+        {
+            if (MessageBox.Show(
+                    "Pixelreinigung auf " + cfg.Monitor + " starten?\n\n" +
+                    "Der Bildschirm ist dafür etwa 6 Minuten schwarz. In der Zeit den Monitor nicht ausschalten " +
+                    "und nicht auf den anderen PC wechseln, sonst bricht die Reinigung ab.\n\n" +
+                    "MonitorSwitch hält diesen PC so lange wach.",
+                    "MonitorSwitch - Pixelreinigung", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+
+            switch (Ddc.StartPixelCleaning(cfg.Monitor))
+            {
+                case Ddc.CleanResult.Started:
+                    cleaningUntil = DateTime.Now + Ddc.PixelCleaningDuration;
+                    Util.KeepAwake(true);
+                    cleanTimer.Interval = (int)Ddc.PixelCleaningDuration.TotalMilliseconds;
+                    cleanTimer.Start();
+                    Info("Pixelreinigung gestartet, fertig gegen " + cleaningUntil.ToString("HH:mm") + ".", ToolTipIcon.Info);
+                    break;
+                case Ddc.CleanResult.NotSupported:
+                    Info("Dieser Monitor unterstützt das Starten der Pixelreinigung per DDC/CI nicht.", ToolTipIcon.Warning);
+                    break;
+                case Ddc.CleanResult.NotFound:
+                    Info("Monitor '" + cfg.Monitor + "' nicht gefunden.", ToolTipIcon.Warning);
+                    break;
+                default:
+                    Info("Pixelreinigung konnte nicht gestartet werden. Ist DDC/CI im Monitor-Menü aktiviert?", ToolTipIcon.Error);
+                    break;
+            }
+        }
+
+        void CleaningFinished()
+        {
+            cleanTimer.Stop();
+            cleaningUntil = DateTime.MinValue;
+            Util.KeepAwake(false);
+            Info("Pixelreinigung sollte abgeschlossen sein.", ToolTipIcon.Info);
         }
 
         void SwitchToTarget()
@@ -650,6 +791,11 @@ namespace MonitorSwitch
 
         void SwitchTo(int value)
         {
+            if (Cleaning && MessageBox.Show(
+                    "Die Pixelreinigung läuft noch bis etwa " + cleaningUntil.ToString("HH:mm") + ".\n" +
+                    "Ein Wechsel des Eingangs bricht sie ab. Trotzdem wechseln?",
+                    "MonitorSwitch", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
             lastSwitch = DateTime.Now;
             if (!Ddc.SetInput(cfg.Monitor, value))
                 Info("Wechsel zu " + cfg.InputName(value) + " fehlgeschlagen. Ist DDC/CI im Monitor-Menü aktiviert?", ToolTipIcon.Error);
@@ -810,6 +956,24 @@ namespace MonitorSwitch
                 return 0;
             }
 
+            if (a == "--clean")
+            {
+                if (c.Monitor.Length == 0) Util.AutoDetect(c);
+                Ddc.CleanResult res = Ddc.StartPixelCleaning(c.Monitor);
+                if (res == Ddc.CleanResult.Started)
+                {
+                    // Prozess laeuft unsichtbar weiter und haelt das Bildsignal, bis die Reinigung durch ist
+                    Util.KeepAwake(true);
+                    Thread.Sleep(Ddc.PixelCleaningDuration);
+                    Util.KeepAwake(false);
+                    return 0;
+                }
+                Error(res == Ddc.CleanResult.NotSupported
+                    ? "Dieser Monitor unterstützt das Starten der Pixelreinigung per DDC/CI nicht.\nMonitor: " + c.Monitor
+                    : "Pixelreinigung konnte nicht gestartet werden.\nMonitor: " + (c.Monitor.Length > 0 ? c.Monitor : "(keiner gefunden)"));
+                return 1;
+            }
+
             int value;
             if (a == "--target")
             {
@@ -828,7 +992,8 @@ namespace MonitorSwitch
                     "  MonitorSwitch.exe                 Tray-Modus\n" +
                     "  MonitorSwitch.exe --target        zum eingestellten Ziel wechseln\n" +
                     "  MonitorSwitch.exe --set 0x11      zu einem bestimmten Eingang wechseln\n" +
-                    "  MonitorSwitch.exe --list          Monitore und Eingänge anzeigen",
+                    "  MonitorSwitch.exe --list          Monitore und Eingänge anzeigen\n" +
+                    "  MonitorSwitch.exe --clean         Pixelreinigung starten (ASUS ROG OLED)",
                     "MonitorSwitch", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return 2;
             }

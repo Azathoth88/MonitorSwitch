@@ -18,8 +18,18 @@ Das Rechtsklick-Menü bietet:
 - **Ziel für Klick und Hotkey** – Eingang, auf den gewechselt wird. Die Liste kommt direkt vom Monitor.
 - **Jetzt wechseln zu** – einmalig auf einen beliebigen Eingang springen
 - **Eingang umbenennen** – z. B. `HDMI 1` → `Gaming-PC`
+- **Pixelreinigung starten** – nur bei ASUS-ROG-OLED-Monitoren, siehe unten
 - **Monitor** – welcher Monitor gesteuert wird, falls mehrere DDC/CI unterstützen
 - **Mit Windows starten**, **Desktop-Verknüpfung erstellen**, **Konfiguration bearbeiten / neu laden**
+
+## Pixelreinigung (ASUS ROG OLED)
+
+OLED-Monitore von ASUS haben eine Pixelreinigung gegen Einbrennen und Geisterbilder. Normalerweise läuft sie automatisch im Standby oder wird über das Monitor-Menü gestartet. MonitorSwitch kann sie auch per DDC/CI anstoßen:
+
+- Tray-Menü → **Pixelreinigung starten…** (mit Sicherheitsabfrage) oder `MonitorSwitch.exe --clean`
+- Der Bildschirm ist dann etwa **6 Minuten** schwarz. In der Zeit den Monitor nicht ausschalten und nicht umschalten, sonst bricht die Reinigung ab. MonitorSwitch hält den PC so lange wach und warnt, wenn man währenddessen wechseln will.
+- Technisch: Im Herstellercode `0xFD` wird Bit `0x10` gesetzt, die anderen Bits bleiben unverändert. Der Monitor setzt das Bit danach selbst zurück.
+- Getestet mit dem **ROG Swift OLED PG34WCDN**. Für den PG49WCD hat das Projekt [asus-pixel-cleaner](https://codeberg.org/beeb/asus-pixel-cleaner) denselben Mechanismus gefunden. Der Menüpunkt erscheint nur bei Monitoren mit „ROG“ im Namen, deren `0xFD` das Reinigungsbit anbietet.
 
 ## Einrichtung mit zwei PCs
 
@@ -51,6 +61,7 @@ MonitorSwitch.exe                 :: Tray-Modus
 MonitorSwitch.exe --target        :: zum eingestellten Ziel wechseln
 MonitorSwitch.exe --set 0x11      :: zu einem bestimmten Eingang wechseln
 MonitorSwitch.exe --list          :: Monitore und Eingänge anzeigen
+MonitorSwitch.exe --clean         :: Pixelreinigung starten (ASUS ROG OLED, läuft ca. 7 min unsichtbar weiter)
 ```
 
 Übliche Eingangswerte: `0x0F` DisplayPort 1, `0x10` DisplayPort 2, `0x11` HDMI 1, `0x12` HDMI 2, `0x1A` USB-C (herstellerspezifisch).

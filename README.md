@@ -28,6 +28,11 @@ OLED-Monitore von ASUS haben eine Pixelreinigung gegen Einbrennen und Geisterbil
 
 - Tray-Menü → **Pixelreinigung starten…** (mit Sicherheitsabfrage) oder `MonitorSwitch.exe --clean`
 - Der Bildschirm ist dann etwa **6 Minuten** schwarz. In der Zeit den Monitor nicht ausschalten und nicht umschalten, sonst bricht die Reinigung ab. MonitorSwitch hält den PC so lange wach und warnt, wenn man währenddessen wechseln will.
+- **Automatische Erinnerung:** Tray-Menü → **Automatisch erinnern** → alle 4, 6, 8, 12 oder 24 Stunden Nutzung (oder ein eigener Wert über `CleanInterval=` in der `.ini`). Ist die Zeit erreicht, erscheint unten rechts ein Fenster mit **Jetzt reinigen**, **5 / 15 / 30 Min später** und **Abbrechen**.
+  - Gezählt wird nur echte Nutzung: Jemand ist am PC (Eingabe in den letzten 5 Minuten), und der Monitor zeigt diesen PC, also nicht das eingestellte Ziel. Bei zwei PCs zählt jeder PC nur seine eigene Zeit.
+  - Das Fenster liegt im Vordergrund, nimmt aber keinen Tastaturfokus. Wer gerade tippt, löst nichts aus Versehen aus, bestätigt wird mit der Maus.
+  - Bei Vollbildspielen, Präsentationen und „Nicht stören“ wartet die Erinnerung, bis das vorbei ist.
+  - **Abbrechen** überspringt diese Runde, der Zähler beginnt neu. Jede gestartete Reinigung setzt den Zähler ebenfalls zurück.
 - Technisch: Im Herstellercode `0xFD` wird Bit `0x10` gesetzt, die anderen Bits bleiben unverändert. Der Monitor setzt das Bit danach selbst zurück.
 - Getestet mit dem **ROG Swift OLED PG34WCDN**. Für den PG49WCD hat das Projekt [asus-pixel-cleaner](https://codeberg.org/beeb/asus-pixel-cleaner) denselben Mechanismus gefunden. Der Menüpunkt erscheint nur bei Monitoren mit „ROG“ im Namen, deren `0xFD` das Reinigungsbit anbietet.
 
@@ -75,6 +80,8 @@ MonitorSwitch.exe --clean         :: Pixelreinigung starten (ASUS ROG OLED, läu
 Monitor=ROG SWIFT PG34WCDN
 Target=0x11
 Hotkey=Ctrl+Alt+F12
+CleanInterval=8
+CleanUsageMinutes=0
 Name_0x11=Gaming-PC
 ```
 

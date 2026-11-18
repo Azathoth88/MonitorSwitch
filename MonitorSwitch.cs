@@ -9,7 +9,8 @@
 //   - Linksklick aufs Tray-Icon oder Hotkey (Standard Strg+Alt+F12) -> zum Ziel-Eingang wechseln
 //   - Rechtsklick -> Menü: Ziel wählen, direkt auf einen Eingang wechseln, Eingänge umbenennen,
 //                    Monitor wählen, Autostart, Desktop-Verknüpfung
-//   - Pixelreinigung (ASUS ROG OLED) per Menue oder --clean anstossen
+//   - Pixelreinigung (ASUS ROG OLED) per Menue oder --clean anstossen, optional automatische
+//     Erinnerung alle n Stunden Nutzung (Popup mit Jetzt / 5 / 15 / 30 Min / Abbrechen)
 //   - Kommandozeile: MonitorSwitch.exe --target | --set 0x11 | --list | --clean
 //
 // Konfiguration: MonitorSwitch.ini neben der .exe (Fallback: %APPDATA%\MonitorSwitch),
@@ -34,7 +35,7 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("MonitorSwitch")]
 [assembly: AssemblyProduct("MonitorSwitch")]
-[assembly: AssemblyVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
 
 namespace MonitorSwitch
 {
@@ -76,8 +77,13 @@ namespace MonitorSwitch
         // Wenn der Monitor keine Eingangsliste liefert
         public static readonly int[] FallbackInputs = { 0x0F, 0x10, 0x11, 0x12, 0x1A };
 
+        // DDC/CI ist ein langsamer I2C-Bus: nie zwei Abfragen gleichzeitig (Tray-Menue + Hintergrund-Timer).
+        // All() nimmt die Sperre, Free() gibt sie wieder frei; beide stehen immer als Paar in try/finally.
+        static readonly object Bus = new object();
+
         static List<PHYSICAL_MONITOR> All()
         {
+            System.Threading.Monitor.Enter(Bus);
             List<PHYSICAL_MONITOR> list = new List<PHYSICAL_MONITOR>();
             MonitorEnumProc cb = delegate(IntPtr h, IntPtr dc, ref RECT r, IntPtr d)
             {
@@ -112,8 +118,12 @@ namespace MonitorSwitch
 
         static void Free(List<PHYSICAL_MONITOR> list)
         {
-            PHYSICAL_MONITOR[] arr = list.ToArray();
-            if (arr.Length > 0) DestroyPhysicalMonitors((uint)arr.Length, arr);
+            try
+            {
+                PHYSICAL_MONITOR[] arr = list.ToArray();
+                if (arr.Length > 0) DestroyPhysicalMonitors((uint)arr.Length, arr);
+            }
+            finally { System.Threading.Monitor.Exit(Bus); }
         }
 
         public static List<string> Names()
@@ -312,6 +322,8 @@ namespace MonitorSwitch
         public int Target = -1;
         public string Hotkey = "Ctrl+Alt+F12";
         public Dictionary<int, string> Names = new Dictionary<int, string>();
+        public double CleanIntervalHours = 0;   // 0 = keine automatische Erinnerung
+        public int CleanUsageMinutes = 0;       // Nutzungszeit seit der letzten Reinigung
 
         static string path;
 
@@ -360,6 +372,8 @@ namespace MonitorSwitch
                     if (key == "monitor") c.Monitor = val;
                     else if (key == "target") c.Target = ParseInt(val);
                     else if (key == "hotkey") c.Hotkey = val;
+                    else if (key == "cleaninterval") c.CleanIntervalHours = Math.Max(0, double.Parse(val.Replace(',', '.'), CultureInfo.InvariantCulture));
+                    else if (key == "cleanusageminutes") c.CleanUsageMinutes = Math.Max(0, ParseInt(val));
                     else if (key.StartsWith("name_") && val.Length > 0) c.Names[ParseInt(key.Substring(5))] = val;
                 }
                 catch (FormatException) { /* ungueltigen Wert ignorieren */ }
@@ -396,6 +410,10 @@ namespace MonitorSwitch
             lines.Add("Target=" + (Target >= 0 ? "0x" + Target.ToString("X2") : ""));
             lines.Add("; Modifier: Ctrl/Strg, Alt, Shift, Win  -  Taste: F1-F24, Pause, Scroll, A-Z, D0-D9 ...");
             lines.Add("Hotkey=" + Hotkey);
+            lines.Add("; Erinnerung an die Pixelreinigung nach so vielen Stunden Nutzung (0 = aus)");
+            lines.Add("CleanInterval=" + CleanIntervalHours.ToString("0.##", CultureInfo.InvariantCulture));
+            lines.Add("; Bisher gezählte Nutzung seit der letzten Reinigung (wird automatisch gepflegt)");
+            lines.Add("CleanUsageMinutes=" + CleanUsageMinutes.ToString(CultureInfo.InvariantCulture));
             lines.Add("; Eigene Namen für Eingänge, z. B. Name_0x11=Gaming-PC");
             List<int> keys = new List<int>(Names.Keys);
             keys.Sort();
@@ -471,6 +489,29 @@ namespace MonitorSwitch
     static class Util
     {
         [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+        [DllImport("shell32.dll")] static extern int SHQueryUserNotificationState(out int state);
+
+        /// <summary>Zeit seit der letzten Maus-/Tastatureingabe.</summary>
+        public static TimeSpan IdleTime()
+        {
+            LASTINPUTINFO li = new LASTINPUTINFO();
+            li.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+            if (!GetLastInputInfo(ref li)) return TimeSpan.Zero;
+            return TimeSpan.FromMilliseconds(unchecked((uint)Environment.TickCount - li.dwTime));
+        }
+
+        /// <summary>false bei Vollbild-Spiel, Praesentation oder "Nicht stoeren" - dann lieber spaeter fragen.</summary>
+        public static bool UserAcceptsPopups()
+        {
+            int state;
+            if (SHQueryUserNotificationState(out state) != 0) return true;
+            const int QUNS_ACCEPTS_NOTIFICATIONS = 5, QUNS_APP = 7;
+            return state == QUNS_ACCEPTS_NOTIFICATIONS || state == QUNS_APP;
+        }
 
         /// <summary>Haelt Bildschirm und PC wach (fuer die Pixelreinigung braucht der Monitor ein Signal). Gilt fuer den aufrufenden Thread.</summary>
         public static void KeepAwake(bool on)
@@ -559,6 +600,126 @@ namespace MonitorSwitch
         }
     }
 
+    // ------------------------------------------------------------------ Erinnerung an die Pixelreinigung
+    /// <summary>
+    /// Kleines Fenster unten rechts. Es liegt im Vordergrund, nimmt aber keinen Tastaturfokus,
+    /// damit ein Tastendruck beim Tippen nichts ausloest - bestaetigt wird mit der Maus.
+    /// Ergebnis: 0 = jetzt reinigen, 5/15/30 = so viele Minuten spaeter erinnern, -1 = abbrechen.
+    /// </summary>
+    class CleanPrompt : Form
+    {
+        public event Action<int> Answered;
+        bool answered;
+
+        public CleanPrompt(string monitor, int usageMinutes)
+        {
+            Text = "MonitorSwitch - Pixelreinigung";
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            ControlBox = false;            // kein X: nur die eindeutigen Knoepfe
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            AutoScaleMode = AutoScaleMode.Font;
+            Font = SystemFonts.MessageBoxFont;
+            Padding = new Padding(12);
+
+            TableLayoutPanel root = new TableLayoutPanel();
+            root.AutoSize = true;
+            root.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            root.ColumnCount = 1;
+            root.Dock = DockStyle.Fill;
+
+            Label title = new Label();
+            title.AutoSize = true;
+            title.Font = new Font(Font.FontFamily, Font.Size * 1.25f, FontStyle.Bold);
+            title.Text = "Pixelreinigung fällig";
+            title.Margin = new Padding(0, 0, 0, 6);
+
+            Label text = new Label();
+            text.AutoSize = true;
+            text.MaximumSize = new Size(380, 0);
+            text.Text = monitor + " war etwa " + FormatDuration(usageMinutes) + " in Benutzung.\n" +
+                        "Die Reinigung dauert ca. 6 Minuten, der Bildschirm ist in der Zeit schwarz.";
+            text.Margin = new Padding(0, 0, 0, 10);
+
+            Button now = MakeButton("Jetzt reinigen", 0);
+            now.Font = new Font(Font, FontStyle.Bold);
+            now.Margin = new Padding(0, 0, 0, 10);
+
+            Label later = new Label();
+            later.AutoSize = true;
+            later.Text = "Später erinnern:";
+            later.Margin = new Padding(0, 0, 0, 4);
+
+            FlowLayoutPanel row = new FlowLayoutPanel();
+            row.AutoSize = true;
+            row.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            row.WrapContents = false;
+            row.Margin = new Padding(0);
+            row.Controls.Add(MakeButton("5 Min", 5));
+            row.Controls.Add(MakeButton("15 Min", 15));
+            row.Controls.Add(MakeButton("30 Min", 30));
+            Button cancel = MakeButton("Abbrechen", -1);
+            cancel.Margin = new Padding(12, 0, 0, 0);
+            row.Controls.Add(cancel);
+
+            root.Controls.Add(title);
+            root.Controls.Add(text);
+            root.Controls.Add(now);
+            root.Controls.Add(later);
+            root.Controls.Add(row);
+            Controls.Add(root);
+        }
+
+        Button MakeButton(string caption, int result)
+        {
+            Button b = new Button();
+            b.Text = caption;
+            b.AutoSize = true;
+            b.MinimumSize = new Size(72, 28);
+            b.Margin = new Padding(0, 0, 6, 0);
+            b.Click += delegate { Answer(result); };
+            return b;
+        }
+
+        void Answer(int result)
+        {
+            if (answered) return;
+            answered = true;
+            if (Answered != null) Answered(result);
+            Close();
+        }
+
+        public static string FormatDuration(int minutes)
+        {
+            if (minutes < 60) return minutes + " Minuten";
+            int h = minutes / 60, m = minutes % 60;
+            return m == 0 ? h + " Stunden" : h + " Std. " + m + " Min.";
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                const int WS_EX_TOPMOST = 0x8, WS_EX_NOACTIVATE = 0x08000000, WS_EX_TOOLWINDOW = 0x80;
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+                return cp;
+            }
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;   // unten rechts, wie eine Benachrichtigung
+            Location = new Point(wa.Right - Width - 16, wa.Bottom - Height - 16);
+        }
+    }
+
     // ------------------------------------------------------------------ Tray-Anwendung
     class TrayApp : ApplicationContext
     {
@@ -568,14 +729,21 @@ namespace MonitorSwitch
 
         readonly NotifyIcon tray;
         readonly HotkeyWindow hotkey;
-        readonly ToolStripMenuItem miMain, miSwitch, miClean, miTarget, miRename, miMonitor, miAutostart;
+        static readonly double[] IntervalChoices = { 4, 6, 8, 12, 24 };
+
+        readonly ToolStripMenuItem miMain, miSwitch, miClean, miAuto, miTarget, miRename, miMonitor, miAutostart;
         readonly ToolStripSeparator sepClean;
         readonly Dictionary<string, List<int>> inputCache = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
         readonly Dictionary<string, bool> cleanSupport = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         readonly System.Windows.Forms.Timer cleanTimer = new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer usageTimer = new System.Windows.Forms.Timer();
+        readonly SynchronizationContext ui;
         Config cfg;
         DateTime lastSwitch = DateTime.MinValue;
         DateTime cleaningUntil = DateTime.MinValue;
+        DateTime snoozeUntil = DateTime.MinValue;
+        CleanPrompt prompt;
+        bool usageBusy;
 
         bool Cleaning { get { return DateTime.Now < cleaningUntil; } }
 
@@ -590,7 +758,8 @@ namespace MonitorSwitch
             miMain      = new ToolStripMenuItem("Wechseln", null, delegate { SwitchToTarget(); });
             miMain.Font = new Font(miMain.Font, FontStyle.Bold);
             miSwitch    = new ToolStripMenuItem("Jetzt wechseln zu");
-            miClean     = new ToolStripMenuItem("Pixelreinigung starten...", null, delegate { StartCleaning(); });
+            miClean     = new ToolStripMenuItem("Pixelreinigung starten...", null, delegate { StartCleaning(true); });
+            miAuto      = new ToolStripMenuItem("Automatisch erinnern");
             sepClean    = new ToolStripSeparator();
             miTarget    = new ToolStripMenuItem("Ziel für Klick und Hotkey");
             miRename    = new ToolStripMenuItem("Eingang umbenennen");
@@ -602,13 +771,13 @@ namespace MonitorSwitch
             ToolStripMenuItem miExit     = new ToolStripMenuItem("Beenden", null, delegate { ExitThread(); });
 
             // Platzhalter, damit die Untermenue-Pfeile sichtbar sind; Inhalt kommt beim Öffnen
-            foreach (ToolStripMenuItem sub in new ToolStripMenuItem[] { miSwitch, miTarget, miRename, miMonitor })
+            foreach (ToolStripMenuItem sub in new ToolStripMenuItem[] { miSwitch, miAuto, miTarget, miRename, miMonitor })
                 sub.DropDownItems.Add("...");
 
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.AddRange(new ToolStripItem[] {
                 miMain, miSwitch,
-                sepClean, miClean,
+                sepClean, miClean, miAuto,
                 new ToolStripSeparator(),
                 miTarget, miRename, miMonitor,
                 new ToolStripSeparator(),
@@ -627,6 +796,12 @@ namespace MonitorSwitch
             tray.Visible = true;
 
             cleanTimer.Tick += delegate { CleaningFinished(); };
+
+            ui = new WindowsFormsSynchronizationContext();
+            usageTimer.Interval = 60 * 1000;
+            usageTimer.Tick += delegate { UsageTick(); };
+            usageTimer.Start();
+            SystemEvents.SessionEnding += OnSessionEnding;
 
             Startup(firstRun);
         }
@@ -652,6 +827,7 @@ namespace MonitorSwitch
         {
             cfg = Config.Load();
             inputCache.Clear();
+            cleanSupport.Clear();
             Util.AutoDetect(cfg);
             ApplyHotkey();
             UpdateTexts();
@@ -734,23 +910,157 @@ namespace MonitorSwitch
                 supported = Ddc.SupportsPixelCleaning(cfg.Monitor);
                 if (cur >= 0) cleanSupport[cfg.Monitor] = supported;   // nur merken, wenn der Monitor geantwortet hat
             }
-            miClean.Visible = sepClean.Visible = supported || Cleaning;
+            miClean.Visible = sepClean.Visible = miAuto.Visible = supported || Cleaning;
             miClean.Enabled = !Cleaning;
             miClean.Text = Cleaning ? "Pixelreinigung läuft (bis " + cleaningUntil.ToString("HH:mm") + ")" : "Pixelreinigung starten...";
+            BuildAutoMenu();
 
             miAutostart.Checked = IsAutostart();
             UpdateTexts();
         }
 
-        void StartCleaning()
+        void BuildAutoMenu()
         {
-            if (MessageBox.Show(
+            miAuto.DropDownItems.Clear();
+            ToolStripMenuItem off = new ToolStripMenuItem("Aus", null, delegate { SetInterval(0); });
+            off.Checked = cfg.CleanIntervalHours <= 0;
+            miAuto.DropDownItems.Add(off);
+
+            bool known = false;
+            foreach (double h in IntervalChoices)
+            {
+                double hours = h;
+                ToolStripMenuItem mi = new ToolStripMenuItem("Alle " + h + " Stunden Nutzung", null, delegate { SetInterval(hours); });
+                mi.Checked = Math.Abs(cfg.CleanIntervalHours - h) < 0.001;
+                known |= mi.Checked;
+                miAuto.DropDownItems.Add(mi);
+            }
+            if (!known && cfg.CleanIntervalHours > 0)   // eigener Wert aus der .ini
+            {
+                ToolStripMenuItem custom = new ToolStripMenuItem("Alle " + cfg.CleanIntervalHours.ToString("0.##") + " Stunden Nutzung (eigener Wert)");
+                custom.Checked = true;
+                miAuto.DropDownItems.Add(custom);
+            }
+
+            if (cfg.CleanIntervalHours > 0)
+            {
+                miAuto.DropDownItems.Add(new ToolStripSeparator());
+                miAuto.DropDownItems.Add(Disabled("Genutzt seit letzter Reinigung: " + CleanPrompt.FormatDuration(cfg.CleanUsageMinutes)));
+                if (DateTime.Now < snoozeUntil)
+                    miAuto.DropDownItems.Add(Disabled("Nächste Erinnerung frühestens " + snoozeUntil.ToString("HH:mm")));
+                miAuto.DropDownItems.Add(new ToolStripMenuItem("Zähler zurücksetzen", null, delegate { ResetUsage(); }));
+            }
+            miAuto.Text = cfg.CleanIntervalHours > 0
+                ? "Automatisch erinnern (alle " + cfg.CleanIntervalHours.ToString("0.##") + " h)"
+                : "Automatisch erinnern";
+        }
+
+        static ToolStripMenuItem Disabled(string text)
+        {
+            ToolStripMenuItem mi = new ToolStripMenuItem(text);
+            mi.Enabled = false;
+            return mi;
+        }
+
+        void SetInterval(double hours)
+        {
+            cfg.CleanIntervalHours = hours;
+            SaveConfig();
+            if (hours > 0)
+                Info("Erinnerung an die Pixelreinigung nach " + hours.ToString("0.##") + " Stunden Nutzung.\n" +
+                     "Bisher gezählt: " + CleanPrompt.FormatDuration(cfg.CleanUsageMinutes) + ".", ToolTipIcon.Info);
+        }
+
+        void ResetUsage()
+        {
+            cfg.CleanUsageMinutes = 0;
+            snoozeUntil = DateTime.MinValue;
+            SaveConfig();
+        }
+
+        // Jede Minute: Nutzungszeit zaehlen, wenn jemand am PC ist und der Monitor diesen PC zeigt.
+        void UsageTick()
+        {
+            if (usageBusy || cfg.CleanIntervalHours <= 0 || Cleaning || cfg.Monitor.Length == 0) return;
+            if (Util.IdleTime() > TimeSpan.FromMinutes(5)) return;   // niemand da
+
+            usageBusy = true;
+            string monitor = cfg.Monitor;
+            bool supported;
+            bool known = cleanSupport.TryGetValue(monitor, out supported);
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                int cur = -1;
+                bool sup = supported;
+                try
+                {
+                    cur = Ddc.GetInput(monitor);   // DDC/CI im Hintergrund, damit das Tray nicht haengt
+                    if (!known && cur >= 0) sup = Ddc.SupportsPixelCleaning(monitor);
+                }
+                catch (Exception) { cur = -1; }
+                ui.Post(delegate { UsageCounted(monitor, cur, sup, known); }, null);
+            });
+        }
+
+        void UsageCounted(string monitor, int cur, bool supported, bool known)
+        {
+            usageBusy = false;
+            if (!string.Equals(monitor, cfg.Monitor, StringComparison.OrdinalIgnoreCase)) return;
+            if (!known && cur >= 0) cleanSupport[monitor] = supported;
+            if (!supported) return;
+            // Monitor aus/nicht erreichbar oder zeigt gerade den anderen PC -> zaehlt dort, nicht hier
+            if (cur < 0 || cur == cfg.Target) return;
+
+            cfg.CleanUsageMinutes++;
+            if (cfg.CleanUsageMinutes % 10 == 0) cfg.Save();
+            MaybePrompt();
+        }
+
+        void MaybePrompt()
+        {
+            if (prompt != null || Cleaning || cfg.CleanIntervalHours <= 0) return;
+            if (cfg.CleanUsageMinutes < cfg.CleanIntervalHours * 60) return;
+            if (DateTime.Now < snoozeUntil) return;
+            if (!Util.UserAcceptsPopups()) return;   // Vollbild/Praesentation: naechste Minute erneut pruefen
+
+            prompt = new CleanPrompt(cfg.Monitor, cfg.CleanUsageMinutes);
+            prompt.Answered += OnPromptAnswered;
+            prompt.FormClosed += delegate { prompt = null; };
+            prompt.Show();
+        }
+
+        void OnPromptAnswered(int result)
+        {
+            if (result == 0)
+            {
+                if (!StartCleaning(false)) snoozeUntil = DateTime.Now.AddMinutes(15);   // nicht jede Minute neu fragen
+            }
+            else if (result > 0)
+            {
+                snoozeUntil = DateTime.Now.AddMinutes(result);
+            }
+            else
+            {
+                ResetUsage();
+                Info("Pixelreinigung übersprungen. Nächste Erinnerung nach " +
+                     cfg.CleanIntervalHours.ToString("0.##") + " Stunden Nutzung.", ToolTipIcon.Info);
+            }
+        }
+
+        void OnSessionEnding(object sender, SessionEndingEventArgs e)
+        {
+            cfg.Save();   // gezaehlte Nutzung nicht verlieren
+        }
+
+        bool StartCleaning(bool ask)
+        {
+            if (ask && MessageBox.Show(
                     "Pixelreinigung auf " + cfg.Monitor + " starten?\n\n" +
                     "Der Bildschirm ist dafür etwa 6 Minuten schwarz. In der Zeit den Monitor nicht ausschalten " +
                     "und nicht auf den anderen PC wechseln, sonst bricht die Reinigung ab.\n\n" +
                     "MonitorSwitch hält diesen PC so lange wach.",
                     "MonitorSwitch - Pixelreinigung", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
-                return;
+                return false;
 
             switch (Ddc.StartPixelCleaning(cfg.Monitor))
             {
@@ -759,17 +1069,18 @@ namespace MonitorSwitch
                     Util.KeepAwake(true);
                     cleanTimer.Interval = (int)Ddc.PixelCleaningDuration.TotalMilliseconds;
                     cleanTimer.Start();
+                    ResetUsage();   // Zaehler fuer die automatische Erinnerung beginnt neu
                     Info("Pixelreinigung gestartet, fertig gegen " + cleaningUntil.ToString("HH:mm") + ".", ToolTipIcon.Info);
-                    break;
+                    return true;
                 case Ddc.CleanResult.NotSupported:
                     Info("Dieser Monitor unterstützt das Starten der Pixelreinigung per DDC/CI nicht.", ToolTipIcon.Warning);
-                    break;
+                    return false;
                 case Ddc.CleanResult.NotFound:
                     Info("Monitor '" + cfg.Monitor + "' nicht gefunden.", ToolTipIcon.Warning);
-                    break;
+                    return false;
                 default:
                     Info("Pixelreinigung konnte nicht gestartet werden. Ist DDC/CI im Monitor-Menü aktiviert?", ToolTipIcon.Error);
-                    break;
+                    return false;
             }
         }
 
@@ -903,6 +1214,12 @@ namespace MonitorSwitch
 
         protected override void ExitThreadCore()
         {
+            usageTimer.Stop();
+            cleanTimer.Stop();
+            SystemEvents.SessionEnding -= OnSessionEnding;
+            if (prompt != null) prompt.Close();
+            Util.KeepAwake(false);
+            cfg.Save();   // gezaehlte Nutzung behalten
             hotkey.Dispose();
             tray.Visible = false;
             tray.Dispose();
